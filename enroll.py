@@ -2,57 +2,96 @@ import cv2
 import face_recognition
 import pickle
 import os
+import numpy as np
 
 # --- Settings ---
-ENCODING_FILE = "authorized_user.pkl"
+DB_FILE = "data/people/authorized_users.pkl"
 # --- End Settings ---
 
-print("Starting enrollment...")
-print("A window will open. Please look at the camera.")
-print("Press 'c' to capture your image. Press 'q' to quit.")
+def load_database():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'rb') as f:
+                return pickle.load(f)
+        except EOFError:
+            return {}
+    return {}
 
-# Use the working camera index you found from test_cam.py
-CAM_INDEX = 0 
-cap = cv2.VideoCapture(CAM_INDEX)
+def save_database(db):
+    with open(DB_FILE, 'wb') as f:
+        pickle.dump(db, f)
 
-if not cap.isOpened():
-    print(f"Error: Cannot open camera at index {CAM_INDEX}.")
-    exit()
+def enroll_user():
+    database = load_database()
+    
+    name = input("Enter the name of the user to enroll: ").strip()
+    if not name:
+        print("Name cannot be empty.")
+        return
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Error: Can't get frame.")
-        break
-        
-    cv2.imshow('Enrollment - Press C to capture', frame)
-    key = cv2.waitKey(1) & 0xFF
+    if name in database:
+        print(f"Warning: '{name}' already exists. Overwriting...")
+    
+    print(f"\n--- Enrolling {name} ---")
+    print("We need to capture 3 angles: Front, Left, and Right.")
+    print("Press 'c' to capture each angle. Press 'q' to quit at any time.\n")
 
-    if key == ord('q'):
-        break
-    elif key == ord('c'):
-        print("Capturing image...")
-        
-        # Convert from BGR (OpenCV) to RGB (face_recognition)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Find the face
-        face_locations = face_recognition.face_locations(rgb_frame)
-        
-        if len(face_locations) == 0:
-            print("No face found. Please try again.")
-        elif len(face_locations) > 1:
-            print("Multiple faces found. Please ensure only you are in the frame.")
-        else:
-            # Get the encoding (the "faceprint")
-            user_encoding = face_recognition.face_encodings(rgb_frame, face_locations)[0]
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Cannot open camera.")
+        return
+
+    angles = ["Front View", "Turn Head Left", "Turn Head Right"]
+    user_encodings = []
+
+    for angle in angles:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error reading frame.")
+                break
+
+            # Display instructions on screen
+            display_frame = frame.copy()
+            cv2.putText(display_frame, f"Capture: {angle}", (10, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+            cv2.putText(display_frame, "Press 'c' to capture", (10, 90), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # Save this encoding to a file
-            with open(ENCODING_FILE, 'wb') as f:
-                pickle.dump(user_encoding, f)
-            
-            print(f"Success! Your 'faceprint' has been saved to {ENCODING_FILE}")
-            break # Exit after successful capture
+            cv2.imshow('Enrollment', display_frame)
+            key = cv2.waitKey(1) & 0xFF
 
-cap.release()
-cv2.destroyAllWindows()
+            if key == ord('q'):
+                print("Enrollment cancelled.")
+                cap.release()
+                cv2.destroyAllWindows()
+                return
+            elif key == ord('c'):
+                # Process image
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # CRITICAL FIX: Force contiguous array
+                rgb_frame = np.ascontiguousarray(rgb_frame, dtype=np.uint8)
+
+                face_locations = face_recognition.face_locations(rgb_frame)
+
+                if len(face_locations) == 0:
+                    print(f"❌ No face detected. Please look at the camera for {angle}.")
+                elif len(face_locations) > 1:
+                    print("❌ Multiple faces detected. Ensure only you are in frame.")
+                else:
+                    # Get encoding
+                    encoding = face_recognition.face_encodings(rgb_frame, face_locations)[0]
+                    user_encodings.append(encoding)
+                    print(f"✅ Captured {angle}!")
+                    break # Move to next angle
+
+    # Save to database
+    database[name] = user_encodings
+    save_database(database)
+    print(f"\nSuccess! User '{name}' enrolled with {len(user_encodings)} angles.")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    enroll_user()
