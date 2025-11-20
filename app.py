@@ -11,61 +11,31 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QLineEdit, 
-                             QStackedWidget, QFrame, QMessageBox)
+                             QStackedWidget, QFrame, QFileDialog, QTabWidget,
+                             QMessageBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
-# --- FIX FOR WINDOWED APP CRASHES ---
-# Redirects stdout/stderr to devnull if packaged as an app to prevent crashes
+# --- PREVENT CRASHES IN PACKAGED APP ---
 if getattr(sys, 'frozen', False):
     sys.stdout = open(os.devnull, 'w')
     sys.stderr = open(os.devnull, 'w')
 
-# --- CONFIGURATION & PATHS ---
-USER_DATA_DIR = Path.home() / "Documents" / "AudioGuard"
-USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_FILE = USER_DATA_DIR / "authorized_users.pkl"
-TOLERANCE = 0.5 # Stricter tolerance for the Lock Screen
+# --- CONSTANTS ---
+TOLERANCE = 0.5
+# Define the standard location for Data
+DOCS_DIR = Path.home() / "Documents" / "AudioGuard"
 
-# Function to find bundled resources (like the encrypted audio)
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+# Ensure the directory exists
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
-# PATHS
-ENCRYPTED_AUDIO_FILE = resource_path(os.path.join("src", "secure_narration.enc"))
-
-# Helper to find external assets (Identity Photo & Decryption Key) next to the App
-def get_external_asset_path(filename):
-    # 1. Check next to the executable (Dist mode)
-    if getattr(sys, 'frozen', False):
-        base_dir = os.path.dirname(sys.executable)
-        # Go up 3 levels from Contents/MacOS/AudioGuard to the folder containing .app
-        bundle_dir = os.path.abspath(os.path.join(base_dir, "../../..")) 
-        path = os.path.join(bundle_dir, filename)
-        if os.path.exists(path): return path
-    
-    # 2. Check next to script (Dev mode)
-    if os.path.exists(filename):
-        return filename
-    
+# --- HELPER: ASSET DISCOVERY ---
+def get_asset_path(filename):
+    """Looks for assets ONLY in ~/Documents/AudioGuard"""
+    target = DOCS_DIR / filename
+    if target.exists():
+        return str(target)
     return None
-
-# --- GLOBAL HELPERS ---
-def load_database():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, 'rb') as f:
-                return pickle.load(f)
-        except: return {}
-    return {}
-
-def save_database(db):
-    with open(DB_FILE, 'wb') as f:
-        pickle.dump(db, f)
 
 def get_audio_device_name():
     try:
@@ -74,446 +44,301 @@ def get_audio_device_name():
         idx = sd.default.device[1]
         info = sd.query_devices(idx)
         return info.get('name', 'Unknown').lower()
-    except:
-        return "speaker (error)"
+    except: return "speaker (error)"
 
-# --- WORKER THREAD ---
-class VideoWorker(QThread):
+# ==========================================
+#   WORKER: PLAYER (Client Side)
+# ==========================================
+class SecurityPlayerWorker(QThread):
     change_pixmap_signal = pyqtSignal(QImage)
     status_signal = pyqtSignal(str, str) 
-    face_detected_signal = pyqtSignal(object)
-    unlock_signal = pyqtSignal(bool)
+    unlock_signal = pyqtSignal()
 
-    def __init__(self, mode="monitor"):
+    def __init__(self):
         super().__init__()
-        self.mode = mode
         self._run_flag = True
         self.cap = None
-        self.db = load_database()
-        self.reference_encoding = None
-        self.last_status_print = ""
+        self.mode = "LOCKED"
+        self.authorized_encodings = []
+        self.decryption_key = None
+        self.audio_path = None
+        pygame.mixer.init()
+        self.audio_paused = True
+        self.audio_loaded = False
+        self.temp_file = None
+
+    def load_assets(self):
+        # Look in Documents/AudioGuard
+        lock_path = get_asset_path("access.lock")
+        if lock_path:
+            try:
+                with open(lock_path, "rb") as f:
+                    data = pickle.load(f)
+                    self.authorized_encodings = data if isinstance(data, list) else [data]
+            except: pass
         
-        # Decryption State
-        self.decrypted_temp_file = None
-        self.current_key_loaded = False
+        key_path = get_asset_path("master.key")
+        if key_path:
+            try: 
+                with open(key_path, "rb") as f: self.decryption_key = f.read()
+            except: pass
 
-        # --- SETUP MODES ---
-        if self.mode == "lock":
-            # Load identity.jpg for verification
-            path = get_external_asset_path("identity.jpg")
-            if path:
-                try:
-                    print(f"[Lock] Loading identity from: {path}")
-                    img = face_recognition.load_image_file(path)
-                    encs = face_recognition.face_encodings(img)
-                    if len(encs) > 0:
-                        self.reference_encoding = encs[0]
-                    else:
-                        print("[Lock] Error: No face found in identity.jpg")
-                except Exception as e:
-                    print(f"[Lock] Error loading identity: {e}")
-            else:
-                print("[Lock] Warning: identity.jpg not found next to app.")
+        self.audio_path = get_asset_path("secure_audio.enc")
 
-        elif self.mode == "monitor":
-            # Pre-load DB encodings
-            self.all_encodings = []
-            for name, data in self.db.items():
-                # Handle potential DB structure differences
-                if isinstance(data, dict): encs = data.get('encodings', [])
-                else: encs = data 
-                self.all_encodings.extend(encs)
-            
-            pygame.mixer.init()
-            self.audio_paused = True
-
-    def decrypt_and_play(self):
-        """Decrypts audio using master.key if face is valid"""
-        if self.current_key_loaded: return True
-
-        key_path = get_external_asset_path("master.key")
-        if not key_path:
-            self.status_signal.emit("Error: master.key missing!", "red")
-            return False
-
+    def decrypt_audio(self):
+        if not self.decryption_key or not self.audio_path: return False
         try:
-            with open(key_path, 'rb') as f:
-                key = f.read()
+            fernet = Fernet(self.decryption_key)
+            with open(self.audio_path, 'rb') as f: encrypted = f.read()
+            decrypted = fernet.decrypt(encrypted)
             
-            fernet = Fernet(key)
-            with open(ENCRYPTED_AUDIO_FILE, 'rb') as f:
-                encrypted_data = f.read()
-            
-            decrypted_data = fernet.decrypt(encrypted_data)
-            
-            # Write to temp file
             self.temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-            self.temp_file.write(decrypted_data)
+            self.temp_file.write(decrypted)
             self.temp_file.close()
             
-            self.decrypted_temp_file = self.temp_file.name
-            pygame.mixer.music.load(self.decrypted_temp_file)
-            pygame.mixer.music.play(-1) # Loop
+            pygame.mixer.music.load(self.temp_file.name)
+            pygame.mixer.music.play(-1)
             pygame.mixer.music.pause()
-            
-            self.current_key_loaded = True
-            print("[Security] Audio decrypted and loaded.")
+            self.audio_loaded = True
             return True
         except Exception as e:
-            print(f"[Security] Decryption failed: {e}")
-            self.status_signal.emit("Decryption Failed", "red")
+            print(f"Decryption Error: {e}")
             return False
 
     def run(self):
+        self.load_assets()
         self.cap = cv2.VideoCapture(0)
         
         while self._run_flag:
             ret, frame = self.cap.read()
             if not ret: break
 
-            # Preprocessing
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb_frame = np.ascontiguousarray(rgb_frame, dtype=np.uint8)
-            small_frame = cv2.resize(rgb_frame, (0, 0), fx=0.25, fy=0.25)
-            small_frame = np.ascontiguousarray(small_frame, dtype=np.uint8)
-            face_locations = face_recognition.face_locations(small_frame)
+            # Resize for speed
+            small = cv2.resize(rgb_frame, (0, 0), fx=0.25, fy=0.25)
+            rgb_small = np.ascontiguousarray(small, dtype=np.uint8)
+            boxes = face_recognition.face_locations(rgb_small)
+            
+            msg = "Initializing..."
+            color = "yellow"
 
-            # --- LOCK MODE ---
-            if self.mode == "lock":
-                if self.reference_encoding is None:
-                    self.status_signal.emit("Error: 'identity.jpg' missing", "red")
-                elif len(face_locations) == 0:
-                    self.status_signal.emit("Scanning for Recipient...", "yellow")
+            if not self.authorized_encodings or not self.decryption_key or not self.audio_path:
+                msg = "NO PACKAGE FOUND in Documents/AudioGuard"; color = "gray"
+            else:
+                if len(boxes) == 0:
+                    msg = "Scanning for Authorized User..."; color = "yellow"
+                    if not self.audio_paused: pygame.mixer.music.pause(); self.audio_paused = True
+                elif len(boxes) > 1:
+                    msg = "Multiple Faces Detected!"; color = "red"
+                    if not self.audio_paused: pygame.mixer.music.pause(); self.audio_paused = True
                 else:
-                    live_encs = face_recognition.face_encodings(small_frame, face_locations)
-                    match = face_recognition.compare_faces([self.reference_encoding], live_encs[0], tolerance=TOLERANCE)
+                    live_enc = face_recognition.face_encodings(rgb_small, boxes)[0]
+                    matches = face_recognition.compare_faces(self.authorized_encodings, live_enc, tolerance=TOLERANCE)
                     
-                    if match[0]:
-                        self.status_signal.emit("IDENTITY CONFIRMED. UNLOCKING...", "green")
-                        self.unlock_signal.emit(True)
-                        # Green Box
-                        for (t, r, b, l) in face_locations:
-                            t*=4; r*=4; b*=4; l*=4
-                            cv2.rectangle(rgb_frame, (l, t), (r, b), (0, 255, 0), 2)
+                    if True in matches:
+                        dev_name = get_audio_device_name()
+                        if 'speaker' in dev_name:
+                            msg = "Connect Headphones to Play"; color = "red"
+                            if not self.audio_paused: pygame.mixer.music.pause(); self.audio_paused = True
+                        else:
+                            msg = f"SECURE PLAYBACK | {dev_name[:10]}"; color = "green"
+                            if self.mode == "LOCKED":
+                                self.mode = "MONITORING"
+                                self.unlock_signal.emit()
+                                self.decrypt_audio()
+                            
+                            if self.audio_loaded and self.audio_paused:
+                                pygame.mixer.music.unpause()
+                                self.audio_paused = False
                     else:
-                        self.status_signal.emit("ACCESS DENIED: Face Mismatch", "red")
-                        # Red Box
-                        for (t, r, b, l) in face_locations:
-                            t*=4; r*=4; b*=4; l*=4
-                            cv2.rectangle(rgb_frame, (l, t), (r, b), (255, 0, 0), 2)
+                        msg = "ACCESS DENIED"; color = "red"
+                        if not self.audio_paused: pygame.mixer.music.pause(); self.audio_paused = True
 
-            # --- ENROLL MODE ---
-            elif self.mode == "enroll":
-                if len(face_locations) == 1:
-                    self.status_signal.emit("Face Detected - Ready", "green")
-                    self.face_detected_signal.emit((rgb_frame, face_locations))
-                elif len(face_locations) == 0:
-                    self.status_signal.emit("No Face Detected", "red")
-                else:
-                    self.status_signal.emit("Multiple Faces", "red")
+            self.status_signal.emit(msg, color)
 
-            # --- MONITOR MODE ---
-            elif self.mode == "monitor":
-                dev_name = get_audio_device_name()
-                is_speaker = 'speaker' in dev_name
-                face_valid = False
-                status_msg = "Locked"
-                color = "red"
-
-                if len(face_locations) == 0:
-                    status_msg = "No Face"
-                elif len(face_locations) > 1:
-                    status_msg = "Multiple Faces"
-                elif is_speaker:
-                    status_msg = "⚠️ SPEAKERS DETECTED"
-                else:
-                    # Authenticate
-                    encs = face_recognition.face_encodings(small_frame, face_locations)
-                    # Check against DB OR against Identity.jpg (Dual fallback)
-                    valid_user = False
-                    
-                    # 1. Check DB
-                    if self.all_encodings:
-                        matches = face_recognition.compare_faces(self.all_encodings, encs[0], tolerance=TOLERANCE)
-                        if True in matches: valid_user = True
-                    
-                    # 2. If DB empty (first run), check Identity Match again
-                    if not valid_user and self.reference_encoding is not None:
-                        match = face_recognition.compare_faces([self.reference_encoding], encs[0], tolerance=TOLERANCE)
-                        if match[0]: valid_user = True
-
-                    if valid_user:
-                        face_valid = True
-                        status_msg = f"Secure Playback | {dev_name[:10]}"
-                        color = "green"
-                    else:
-                        status_msg = "⛔ Unauthorized"
-
-                # Update UI
-                self.status_signal.emit(status_msg, color)
-                
-                # Audio Logic
-                if face_valid and not is_speaker:
-                    # Attempt Decryption
-                    if not self.current_key_loaded:
-                        success = self.decrypt_and_play()
-                        if not success: face_valid = False
-                    
-                    if face_valid and self.audio_paused:
-                        pygame.mixer.music.unpause()
-                        self.audio_paused = False
-                else:
-                    if not self.audio_paused:
-                        pygame.mixer.music.pause()
-                        self.audio_paused = True
-                
-                # Draw Boxes
-                for (t, r, b, l) in face_locations:
-                    t*=4; r*=4; b*=4; l*=4
-                    c = (0, 255, 0) if color == "green" else (255, 0, 0)
-                    cv2.rectangle(rgb_frame, (l, t), (r, b), c, 2)
-
-            # Render
             h, w, ch = rgb_frame.shape
             qt_img = QImage(rgb_frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
-            p = qt_img.scaled(800, 600, Qt.AspectRatioMode.KeepAspectRatio)
+            p = qt_img.scaled(640, 480, Qt.AspectRatioMode.KeepAspectRatio)
             self.change_pixmap_signal.emit(p)
 
         self.cap.release()
-        if self.mode == "monitor": pygame.mixer.music.stop()
-        self.cleanup()
-
-    def cleanup(self):
-        if self.decrypted_temp_file and os.path.exists(self.decrypted_temp_file):
-            try:
-                os.remove(self.decrypted_temp_file)
-                print("[Security] Temp file wiped.")
+        pygame.mixer.music.stop()
+        if self.temp_file:
+            try: os.remove(self.temp_file.name)
             except: pass
 
     def stop(self):
         self._run_flag = False
         self.wait()
 
-# --- MAIN GUI ---
-class AudioGuardApp(QMainWindow):
+# ==========================================
+#   MAIN APP WINDOW
+# ==========================================
+class UnifiedApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AudioGuard - Secure Courier")
-        self.resize(1000, 700)
-        self.setStyleSheet("background-color: #1e1e1e; color: #ffffff;")
-
+        self.setWindowTitle("AudioGuard: Generator & Player")
+        self.resize(900, 700)
+        self.setStyleSheet("background-color: #1e1e1e; color: white; font-family: Arial;")
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.layout = QHBoxLayout(self.central_widget)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-
-        self.create_sidebar()
-        self.stack = QStackedWidget()
-        self.layout.addWidget(self.stack)
-
-        self.page_lock = self.create_lock_page()
-        self.page_home = self.create_home_page()
-        self.page_enroll = self.create_enroll_page()
-        self.page_monitor = self.create_monitor_page()
-
-        self.stack.addWidget(self.page_lock)
-        self.stack.addWidget(self.page_home)
-        self.stack.addWidget(self.page_enroll)
-        self.stack.addWidget(self.page_monitor)
+        self.layout = QVBoxLayout(self.central_widget)
         
-        # Start in Lock Mode
-        self.sidebar.hide()
-        self.start_lock_mode()
-        
-        self.enroll_step = 0
-        self.temp_encodings = []
-        self.enroll_name = ""
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #444; }
+            QTabBar::tab { background: #333; color: #aaa; padding: 10px 20px; }
+            QTabBar::tab:selected { background: #007acc; color: white; }
+        """)
+        self.layout.addWidget(self.tabs)
 
-    def create_sidebar(self):
-        self.sidebar = QFrame()
-        self.sidebar.setStyleSheet("background-color: #2d2d2d; border-right: 1px solid #3d3d3d;")
-        self.sidebar.setFixedWidth(220)
-        sb_layout = QVBoxLayout(self.sidebar)
-        sb_layout.setSpacing(20)
-        sb_layout.setContentsMargins(20, 40, 20, 20)
+        self.player_tab = QWidget()
+        self.setup_player_tab()
+        self.tabs.addTab(self.player_tab, "Secure Player")
+
+        self.generator_tab = QWidget()
+        self.setup_generator_tab()
+        self.tabs.addTab(self.generator_tab, "Package Generator (Admin)")
         
-        title = QLabel("AUDIO\nGUARD")
+        self.player_thread = None
+        self.tabs.currentChanged.connect(self.handle_tab_change)
+        
+        # Default: Check if files exist in Documents. If yes, Player. Else, Generator.
+        if get_asset_path("access.lock"): 
+            self.tabs.setCurrentIndex(0)
+            self.handle_tab_change(0)
+        else:
+            self.tabs.setCurrentIndex(1)
+            self.handle_tab_change(1)
+
+    def setup_player_tab(self):
+        layout = QVBoxLayout(self.player_tab)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_title = QLabel("SECURE ACCESS LOCKED")
+        self.lbl_title.setFont(QFont("Arial", 24, QFont.Weight.Bold))
+        self.lbl_title.setStyleSheet("color: #ff5555")
+        layout.addWidget(self.lbl_title)
+        
+        self.lbl_info = QLabel(f"Looking for keys in:\n{DOCS_DIR}")
+        self.lbl_info.setStyleSheet("color: #888; margin-bottom: 10px;")
+        self.lbl_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.lbl_info)
+
+        self.lbl_status = QLabel("System Idle")
+        self.lbl_status.setFont(QFont("Arial", 14))
+        self.lbl_status.setStyleSheet("background: #333; padding: 8px; border-radius: 4px;")
+        layout.addWidget(self.lbl_status)
+        self.lbl_video = QLabel()
+        self.lbl_video.setFixedSize(640, 480)
+        self.lbl_video.setStyleSheet("background: black; border: 2px solid #444;")
+        layout.addWidget(self.lbl_video)
+
+    def handle_tab_change(self, index):
+        if self.player_thread:
+            self.player_thread.stop()
+            self.player_thread = None
+            self.lbl_video.clear()
+            self.lbl_title.setText("SECURE ACCESS LOCKED")
+            self.lbl_title.setStyleSheet("color: #ff5555")
+
+        if index == 0: # Player Tab
+            self.player_thread = SecurityPlayerWorker()
+            self.player_thread.change_pixmap_signal.connect(lambda x: self.lbl_video.setPixmap(QPixmap.fromImage(x)))
+            self.player_thread.status_signal.connect(self.update_player_ui)
+            self.player_thread.unlock_signal.connect(lambda: self.lbl_title.setText("DECRYPTING & PLAYING"))
+            self.player_thread.start()
+
+    def update_player_ui(self, msg, color):
+        self.lbl_status.setText(msg)
+        border = "#00ff00" if color == "green" else "#ff0000"
+        if color == "yellow": border = "#ffff00"
+        elif color == "gray": border = "#444444"
+        self.lbl_video.setStyleSheet(f"background: black; border: 3px solid {border};")
+        if color == "green": self.lbl_title.setStyleSheet("color: #00ff00")
+
+    def setup_generator_tab(self):
+        layout = QVBoxLayout(self.generator_tab)
+        title = QLabel("Create Secure Package")
         title.setFont(QFont("Arial", 20, QFont.Weight.Bold))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sb_layout.addWidget(title)
-        
-        btn_style = "QPushButton { background-color: #3d3d3d; padding: 15px; border-radius: 5px; text-align: left; } QPushButton:hover { background-color: #4d4d4d; }"
-        
-        btn_home = QPushButton("  🏠  Home")
-        btn_home.setStyleSheet(btn_style)
-        btn_home.clicked.connect(lambda: self.switch_page(1))
-        
-        btn_enroll = QPushButton("  👤  Registration")
-        btn_enroll.setStyleSheet(btn_style)
-        btn_enroll.clicked.connect(lambda: self.switch_page(2))
-        
-        btn_monitor = QPushButton("  🔐  Decrypt & Play")
-        btn_monitor.setStyleSheet(btn_style)
-        btn_monitor.clicked.connect(lambda: self.switch_page(3))
-        
-        sb_layout.addWidget(btn_home)
-        sb_layout.addWidget(btn_enroll)
-        sb_layout.addWidget(btn_monitor)
-        sb_layout.addStretch()
-        self.layout.addWidget(self.sidebar)
+        layout.addWidget(title)
+        self.inputs = {}
+        form_layout = QVBoxLayout()
+        for label in ["Photo 1 (Front)", "Photo 2 (Left)", "Photo 3 (Right)", "Audio File (.mp3)"]:
+            row = QHBoxLayout()
+            lbl = QLabel(label); lbl.setFixedWidth(120)
+            entry = QLineEdit(); entry.setReadOnly(True); entry.setStyleSheet("padding: 5px; background: #333;")
+            btn = QPushButton("Browse")
+            btn.clicked.connect(lambda checked, e=entry, t=label: self.browse_file(e, t))
+            row.addWidget(lbl); row.addWidget(entry); row.addWidget(btn)
+            form_layout.addLayout(row)
+            self.inputs[label] = entry
+        layout.addLayout(form_layout)
+        self.btn_gen = QPushButton("GENERATE SECURE PACKAGE")
+        self.btn_gen.setStyleSheet("background: #007acc; padding: 15px; font-weight: bold; font-size: 14px;")
+        self.btn_gen.clicked.connect(self.run_generation_safe)
+        layout.addWidget(self.btn_gen)
+        layout.addStretch()
 
-    # --- PAGE CREATORS ---
-    def create_lock_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl = QLabel("SECURE COURIER LOCKED")
-        lbl.setFont(QFont("Arial", 26, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #ff5555")
-        layout.addWidget(lbl)
-        self.lock_status = QLabel("Verifying Recipient Identity...")
-        self.lock_status.setFont(QFont("Arial", 16))
-        layout.addWidget(self.lock_status)
-        self.lock_video = QLabel()
-        self.lock_video.setFixedSize(640, 480)
-        self.lock_video.setStyleSheet("background: black; border: 2px solid #555;")
-        layout.addWidget(self.lock_video, alignment=Qt.AlignmentFlag.AlignCenter)
-        return page
+    def browse_file(self, entry_widget, file_type):
+        filter_str = "Images (*.png *.jpg *.jpeg *.bmp)" if "Photo" in file_type else "Audio (*.mp3 *.wav)"
+        fname, _ = QFileDialog.getOpenFileName(self, f"Select {file_type}", "", filter_str)
+        if fname: entry_widget.setText(fname)
 
-    def create_home_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl = QLabel("Identity Verified")
-        lbl.setFont(QFont("Arial", 24, QFont.Weight.Bold))
-        layout.addWidget(lbl)
-        desc = QLabel("1. Register your face angles for better accuracy.\n2. Proceed to Decrypt & Play.")
-        desc.setStyleSheet("color: #aaa; font-size: 14px;")
-        layout.addWidget(desc)
-        return page
+    def run_generation_safe(self):
+        p1 = self.inputs["Photo 1 (Front)"].text()
+        p2 = self.inputs["Photo 2 (Left)"].text()
+        p3 = self.inputs["Photo 3 (Right)"].text()
+        audio = self.inputs["Audio File (.mp3)"].text()
 
-    def create_enroll_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("User Registration", font=QFont("Arial", 22)))
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Enter Name")
-        self.name_input.setStyleSheet("padding: 10px; background: #333; color: white;")
-        layout.addWidget(self.name_input)
-        self.enroll_status = QLabel("Enter name and start")
-        self.enroll_status.setStyleSheet("color: yellow; font-size: 16px;")
-        layout.addWidget(self.enroll_status)
-        self.enroll_video = QLabel()
-        self.enroll_video.setFixedSize(640, 480)
-        self.enroll_video.setStyleSheet("background: black;")
-        layout.addWidget(self.enroll_video, alignment=Qt.AlignmentFlag.AlignCenter)
-        self.enroll_btn = QPushButton("Start Registration")
-        self.enroll_btn.setStyleSheet("background: #007acc; padding: 15px;")
-        self.enroll_btn.clicked.connect(self.handle_enroll_click)
-        layout.addWidget(self.enroll_btn)
-        return page
+        if not all([p1, p2, p3, audio]):
+            QMessageBox.warning(self, "Error", "Please select all files.")
+            return
 
-    def create_monitor_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.addWidget(QLabel("Secure Decryption Player", font=QFont("Arial", 22)))
-        self.monitor_status = QLabel("Initializing...")
-        self.monitor_status.setStyleSheet("background: #333; padding: 10px;")
-        layout.addWidget(self.monitor_status)
-        self.monitor_video = QLabel()
-        self.monitor_video.setFixedSize(640, 480)
-        self.monitor_video.setStyleSheet("background: black;")
-        layout.addWidget(self.monitor_video, alignment=Qt.AlignmentFlag.AlignCenter)
-        return page
+        self.btn_gen.setText("Generating... Please Wait...")
+        self.btn_gen.setEnabled(False)
+        QApplication.processEvents()
 
-    # --- NAVIGATION & LOGIC ---
-    def switch_page(self, index):
-        if self.thread: self.thread.stop()
-        self.stack.setCurrentIndex(index)
-        if index == 2: self.start_enroll_mode()
-        elif index == 3: self.start_monitor_mode()
+        try:
+            # Output to a folder named "New_Package" in the project directory
+            out_dir = "New_Package"
+            if not os.path.exists(out_dir): os.makedirs(out_dir)
 
-    def start_lock_mode(self):
-        self.thread = VideoWorker(mode="lock")
-        self.thread.change_pixmap_signal.connect(lambda x: self.lock_video.setPixmap(QPixmap.fromImage(x)))
-        self.thread.status_signal.connect(lambda m, c: self.lock_status.setText(m))
-        self.thread.unlock_signal.connect(self.handle_unlock)
-        self.thread.start()
+            encodings = []
+            for i, p in enumerate([p1, p2, p3]):
+                self.btn_gen.setText(f"Processing Photo {i+1}/3...")
+                QApplication.processEvents()
+                img = face_recognition.load_image_file(p)
+                if img.shape[0] > 800:
+                    scale = 800 / img.shape[0]
+                    img = cv2.resize(img, (0,0), fx=scale, fy=scale)
+                encs = face_recognition.face_encodings(img)
+                if not encs: raise Exception(f"No face in Photo {i+1}")
+                encodings.append(encs[0])
 
-    def handle_unlock(self, success):
-        if success:
-            self.thread.stop()
-            self.sidebar.show()
-            self.switch_page(1) # Go Home
-            QMessageBox.information(self, "Access Granted", "Identity Verified.\nEnvironment Unlocked.")
+            with open(os.path.join(out_dir, "access.lock"), "wb") as f: pickle.dump(encodings, f)
 
-    def start_enroll_mode(self):
-        self.enroll_step = -1
-        self.name_input.setEnabled(True); self.name_input.clear()
-        self.enroll_btn.setText("Start Registration")
-        self.enroll_status.setText("Enter Name")
-        self.thread = VideoWorker(mode="enroll")
-        self.thread.change_pixmap_signal.connect(lambda x: self.enroll_video.setPixmap(QPixmap.fromImage(x)))
-        self.thread.status_signal.connect(self.update_enroll_status)
-        self.thread.face_detected_signal.connect(self.store_frame)
-        self.thread.start()
+            self.btn_gen.setText("Encrypting Audio...")
+            QApplication.processEvents()
+            key = Fernet.generate_key()
+            with open(os.path.join(out_dir, "master.key"), "wb") as f: f.write(key)
+            with open(audio, "rb") as f: raw_audio = f.read()
+            fernet = Fernet(key)
+            enc_audio = fernet.encrypt(raw_audio)
+            with open(os.path.join(out_dir, "secure_audio.enc"), "wb") as f: f.write(enc_audio)
 
-    def update_enroll_status(self, msg, color):
-        if "Capture" in self.enroll_btn.text():
-            self.enroll_status.setText(msg)
-            self.enroll_status.setStyleSheet(f"color: {color}; font-size: 16px;")
-
-    def store_frame(self, data): self.current_frame = data
-
-    def handle_enroll_click(self):
-        if self.enroll_step == -1:
-            name = self.name_input.text().strip()
-            if not name: return
-            self.enroll_name = name
-            self.name_input.setEnabled(False)
-            self.enroll_step = 0
-            self.enroll_btn.setText("Capture FRONT")
-            self.enroll_status.setText("Look at camera")
-        elif self.enroll_step < 3:
-            if not hasattr(self, 'current_frame'): return
-            rgb, boxes = self.current_frame
-            if len(boxes) != 1: return
-            rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-            enc = face_recognition.face_encodings(rgb, boxes)[0]
-            self.temp_encodings.append(enc)
-            self.enroll_step += 1
-            if self.enroll_step == 1: self.enroll_btn.setText("Capture LEFT")
-            elif self.enroll_step == 2: self.enroll_btn.setText("Capture RIGHT")
-            elif self.enroll_step == 3:
-                db = load_database()
-                db[self.enroll_name] = {'encodings': self.temp_encodings}
-                save_database(db)
-                self.enroll_status.setText("Saved!")
-                self.enroll_btn.setText("Done")
-                self.enroll_btn.clicked.disconnect()
-                self.enroll_btn.clicked.connect(lambda: self.switch_page(1))
-
-    def start_monitor_mode(self):
-        self.thread = VideoWorker(mode="monitor")
-        self.thread.change_pixmap_signal.connect(lambda x: self.monitor_video.setPixmap(QPixmap.fromImage(x)))
-        self.thread.status_signal.connect(self.update_monitor_status)
-        # Identity image is pre-loaded by init if found
-        # If user hasn't enrolled, we can try to set the reference encoding from the Lock mode
-        if self.page_lock.findChild(QLabel): # Quick hack to re-use identity if needed
-             pass 
-        self.thread.start()
-
-    def update_monitor_status(self, msg, color):
-        bg = "#1a4d1a" if color == "green" else "#4d1a1a"
-        self.monitor_status.setText(msg)
-        self.monitor_status.setStyleSheet(f"background: {bg}; padding: 10px;")
+            QMessageBox.information(self, "Success", f"Files created in folder: '{out_dir}'\n\nZip this folder (contents only) and send to the client.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+        finally:
+            self.btn_gen.setText("GENERATE SECURE PACKAGE")
+            self.btn_gen.setEnabled(True)
 
     def closeEvent(self, event):
-        if self.thread: self.thread.stop()
+        if self.player_thread: self.player_thread.stop()
         event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = AudioGuardApp()
+    window = UnifiedApp()
     window.show()
     sys.exit(app.exec())
